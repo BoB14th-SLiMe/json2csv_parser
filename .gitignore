@@ -1,2 +1,6 @@
-/data
-/output
+# macOS 시스템 파일
+.DS_Store
+
+# pcap 데이터 및 결과
+pcap/data/
+pcap/output/
