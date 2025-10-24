@@ -13,6 +13,7 @@ def process_file(input_filename, output_dir):
     """
     CSV 파일 하나를 읽고, 'd' 컬럼의 JSON을 파싱하여 펼친 후,
     지정된 output 폴더에 저장합니다.
+    (개선) 'itms'와 같은 중첩 리스트를 추가로 펼칩니다 (행으로 확장).
     """
     try:
         base_filename = os.path.basename(input_filename)
@@ -27,30 +28,93 @@ def process_file(input_filename, output_dir):
             logging.warning(f"'{base_filename}' has no data to process after dropping NaNs.")
             return None
 
-        # 3. (핵심 개선) orjson으로 JSON 로드 후, pd.json_normalize로 한 번에 펼치기
-        #    - 기존 flatten_json + apply 조합보다 훨씬 빠르고 효율적입니다.
-        #    - 문자열 클리닝 로직은 데이터 형태에 따라 유지합니다.
-        json_series = df['d'].apply(lambda x: json.loads(x.strip('"').replace('""', '"')))
-        
-        # 인덱스를 유지하여 나중에 원본 데이터프레임과 정렬을 맞춥니다.
-        flattened_json_df = pd.json_normalize(json_series)
-        flattened_json_df.index = df.index
+        # 3. orjson으로 JSON 로드
+        def safe_json_load(x):
+            if not isinstance(x, str):
+                return None
+            try:
+                # pandas가 CSV를 읽을 때 "..." -> {...} 로 올바르게 파싱한 경우
+                return json.loads(x)
+            except json.JSONDecodeError:
+                try:
+                    # pandas가 CSV를 잘못 읽어 '"{""prid...""}"' 처럼 문자열이 된 경우
+                    return json.loads(x.strip('"').replace('""', '"'))
+                except Exception:
+                    logging.warning(f"Failed to parse JSON string in {base_filename}: {x[:50]}...")
+                    return None # 여전히 실패하면 None 반환
 
-        # 4. 기존 데이터프레임과 결합 후, 불필요한 'd' 컬럼 제거
-        df_expanded = pd.concat([df, flattened_json_df], axis=1).drop(columns=['d'])
+        json_series = df['d'].apply(safe_json_load)
         
-        # 5. 결과 파일 저장
+        # 파싱에 실패한 행(None) 제거
+        valid_json_indices = json_series.dropna().index
+        if len(valid_json_indices) == 0:
+            logging.warning(f"'{base_filename}' contains no valid JSON in 'd' column after parsing attempts.")
+            return None
+        
+        # 파싱에 성공한 데이터만 유지 (SettingWithCopyWarning 방지)
+        df = df.loc[valid_json_indices].copy()
+        json_series = json_series.loc[valid_json_indices]
+
+        # 4. pd.json_normalize로 1차 펼치기
+        flattened_json_df = pd.json_normalize(json_series)
+        flattened_json_df.index = df.index # 원본 인덱스 유지
+
+        # 5. 원본 데이터프레임과 결합 후, 불필요한 'd' 컬럼 제거
+        df_expanded = pd.concat([df.drop(columns=['d']), flattened_json_df], axis=1)
+
+        # 6. (신규) 중첩된 list 컬럼(itms)을 추가로 펼치는 로직
+        list_columns_to_expand = ['pdu.prm.itms', 'pdu.dat.itms']
+        
+        for col_name in list_columns_to_expand:
+            if col_name in df_expanded.columns:
+                logging.info(f"Expanding nested list in '{col_name}' for {base_filename}...")
+                
+                # 1. 비어있는 리스트([]) / 비어있는 dict({}) / None / NaN 등을 pd.NA로 변환
+                #    explode가 올바르게 작동하도록 함
+                def clean_list(x):
+                    if isinstance(x, list) and len(x) > 0:
+                        return x
+                    return pd.NA
+                    
+                df_expanded[col_name] = df_expanded[col_name].apply(clean_list)
+                
+                # 이 컬럼에 유효한 데이터가 하나도 없으면(전부 NA) 스킵
+                if df_expanded[col_name].isna().all():
+                    logging.info(f"Skipping empty list column '{col_name}'.")
+                    continue
+
+                # 2. 'explode'를 사용하여 리스트의 각 항목을 별도 행으로 분리
+                #    (인덱스가 복제됨. 예: 1, 1, 2, 3, 3, 3)
+                df_expanded = df_expanded.explode(col_name)
+                
+                # 3. 이제 'col_name' 컬럼에는 dict 또는 pd.NA가 들어있음.
+                #    이 dict를 다시 normalize하여 펼침.
+                normalized_col = pd.json_normalize(df_expanded[col_name])
+                
+                # 4. 펼쳐진 컬럼들에 접두사(prefix)를 붙여 이름 충돌 방지
+                #    (예: 'pdu.prm.itms.syn', 'pdu.dat.itms.rc')
+                normalized_col = normalized_col.add_prefix(f"{col_name}.")
+                
+                # 5. 원본 'col_name' 컬럼(이제 dict가 든)을 제거하고,
+                #    펼쳐진 새 컬럼들을 *인덱스* 기준으로 join.
+                #    (join은 인덱스 기준이 기본값)
+                df_expanded = df_expanded.drop(columns=[col_name]).join(normalized_col)
+
+        # 7. (수정) 결과 파일 저장
         output_filename = os.path.join(output_dir, f"{os.path.splitext(base_filename)[0]}_parsed.csv")
-        df_expanded.to_csv(output_filename, index=False)
+        # NaN 값을 빈 문자열('')로 저장 (파싱 결과의 빈 필드 표현)
+        df_expanded.to_csv(output_filename, index=False, na_rep='')
         
         return f"Successfully processed '{base_filename}' -> '{os.path.basename(output_filename)}'"
 
     except Exception as e:
+        # traceback을 포함하여 더 자세한 에러 로깅
+        logging.error(f"Critical error processing '{os.path.basename(input_filename)}': {e}", exc_info=True)
         return f"Error processing '{os.path.basename(input_filename)}': {e}"
 
 def main():
     # ====================================================================
-    # (개선) argparse를 사용하여 커맨드라인에서 경로를 입력받습니다.
+    # argparse를 사용하여 커맨드라인에서 경로를 입력받습니다.
     # ====================================================================
     parser = argparse.ArgumentParser(description="Parse JSON data within CSV files in parallel.")
     parser.add_argument('--input-dir', type=str, default='./pcap/data', help='Directory containing input CSV files.')
