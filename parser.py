@@ -3,247 +3,346 @@ import orjson as json
 import os
 import argparse
 import logging
-import re
 import multiprocessing
 from concurrent.futures import ProcessPoolExecutor
-from typing import Dict, Any, Optional, Tuple, Set
+from typing import Optional, Dict, Tuple, Any, List # (수정) List 추가
+import re # 정규식 모듈 추가
 
-# ====================================================================
 # 로깅 설정
-# ====================================================================
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# ====================================================================
-# 전역 변수 (병렬 작업자 초기화를 위해 사용)
-# ====================================================================
+# 전역 변수 (병렬 작업자 초기화용)
 global_asset_ip_map: Dict[str, str] = {}
-# (신규) 유선 레지스터 맵
-global_wired_register_map: Dict[Tuple[str, str], str] = {}
+# (수정) 맵 구조 변경: { 자산명 -> {레지스터 주소 -> 설명} }
+global_all_register_maps: Dict[str, Dict[str, str]] = {}
 
-# ====================================================================
-# 자산 매핑 관련 헬퍼 함수
-# (asset_mapper.py 로직 통합)
-# ====================================================================
 
-# 자산IP 시트의 장치 이름과 다른 시트의 컬럼 이름을 연결하는 맵
-# {시트 컬럼명: 자산IP 시트의 공식 자산명}
+# --- 자산/레지스터 매핑 로직 (co.py 규칙 적용) ---
+
 DEVICE_NAME_MAP = {
-    # 유선 (Output 시트 기준)
-    'LS 산전 주소': 'LS Electric PLC',
-    'SIEMENS 주소': 'Simens PLC', # '자산IP.csv'에 'Simens'로 되어 있음
-    '미쯔비시 PLC 주소': 'Mitsubishi PLC',
+    # '자산IP' 시트 (유선)
+    'LS Electric PLC': 'LS Electric PLC',
+    'Simens PLC': 'Simens PLC',
+    'Mitsubishi PLC': 'Mitsubishi PLC',
+    'hidden PLC': 'hidden PLC',
+    '탈부착 월 PLC 주소(LS XGI)': '탈부착 월 PLC 주소(LS XGI)',
+    '탈부착 월 PLC 주소(미쓰비시)': '탈부착 월 PLC 주소(미쓰비시)',
+    # (신규) '자산IP' 시트 (무선)
+    '부착형 HMI': '부착형 HMI', # HMI도 자산일 수 있으므로 추가
+    'WirelessHART Gateway': 'WirelessHART Gateway',
+    'Wi-Fi AP': 'Wi-Fi AP',
+    'Wi-Fi Client Module\n(LS PLC)': 'LS Electric PLC', # XGT IP 매핑 오류 수정
+    'Wi-Fi Client Module\n(SIEMENS)': 'Simens PLC', # XGT IP 매핑 오류 수정
+    '5G Router': '5G Router',
+    'LS PLC': 'LS Electric PLC', # XGT IP 매핑 오류 수정
+    # '유선_Input/Output' 시트
     '히든 미쯔비시 PLC 주소': 'hidden PLC',
-    
-    # (신규) 유선 (Input 시트 변형)
-    ' LS PLC 주소': 'LS Electric PLC', # 띄어쓰기 시작
-    '미쯔비시 PLC주소': 'Mitsubishi PLC', # 띄어쓰기 없음
-
-    '탈부착 월 PLC 주소(LS XGI)': '탈부착 월 PLC (LS XGI)', # IP 목록에 없음
-    '탈부착 월 PLC 주소(미쓰비시)': '탈부착 월 PLC (미쓰비시)', # IP 목록에 없음
-
-    # 무선 (현재 레지스터 매핑에서 사용 안 함)
-    'LSE': 'LS PLC', 
-    'Siemens': 'SIEMENS PLC'
+    '미쯔비시 PLC 주소': 'Mitsubishi PLC',
+    '미쯔비시 PLC주소': 'Mitsubishi PLC', 
+    'LS 산전 주소': 'LS Electric PLC',
+    ' LS PLC 주소': 'LS Electric PLC', 
+    'SIEMENS 주소': 'Simens PLC',
+    # '무선' 시트
+    'LSE': 'LS Electric PLC', 
+    'Siemens': 'Simens PLC', 
 }
 
-def clean_ip(ip_str: str) -> Optional[str]:
+# (신규) co.py의 Modbus 오프셋 맵
+# (규칙) key: (자산명, Function Code), value: (오프셋, 주소 타입)
+MODBUS_OFFSET_MAP = {
+    ('Mitsubishi PLC', 3): (400000, 'modbus'),
+    ('Mitsubishi PLC', 4): (300000, 'modbus'),
+    ('LS Electric PLC', 3): (400000, 'modbus'), # (가정)
+    ('LS Electric PLC', 4): (300000, 'modbus'), # (가정)
+    ('hidden PLC', 3): (400000, 'modbus'), # (가정)
+    ('hidden PLC', 4): (300000, 'modbus'), # (가정)
+    # S7 (Simens PLC)는 오프셋 대신 DB 번호를 사용
+    ('Simens PLC', 3): (0, 's7'),
+    ('Simens PLC', 4): (0, 's7'),
+}
+
+def clean_ip(ip_str: str) -> str:
+    """ "192,168.10.25" 같은 비정상 IP를 "192.168.10.25"로 정리 """
+    if isinstance(ip_str, str):
+        return ip_str.replace(',', '.').strip().strip('"')
+    return str(ip_str)
+
+def parse_asset_ip_sheet(df_ip: pd.DataFrame) -> Dict[str, str]:
+    """ '자산IP' 시트를 파싱하여 {IP -> 자산명} 딕셔너리 생성 """
+    ip_map = {}
+    
+    # 1. <무선 ... IP 주소> 섹션
+    df_wireless = df_ip.iloc[3:13, 1:3].dropna(how='all')
+    df_wireless.columns = ['Asset_Name_Raw', 'IP']
+    for _, row in df_wireless.iterrows():
+        # (수정) \n (줄바꿈)이 있는 키를 처리하기 위해 .replace() 추가
+        asset_name_raw_clean = str(row['Asset_Name_Raw']).replace('\r\n', '\n')
+        asset_name = DEVICE_NAME_MAP.get(asset_name_raw_clean)
+        if asset_name and pd.notna(row['IP']):
+            ip = clean_ip(row['IP'])
+            ip_map[ip] = asset_name
+
+    # 2. <유선 ... IP 주소> 섹션
+    df_wired = df_ip.iloc[3:13, 5:7].dropna(how='all')
+    df_wired.columns = ['Asset_Name_Raw', 'IP']
+    for _, row in df_wired.iterrows():
+        asset_name_raw_clean = str(row['Asset_Name_Raw']).replace('\r\n', '\n') # (수정)
+        asset_name = DEVICE_NAME_MAP.get(asset_name_raw_clean)
+        if asset_name and pd.notna(row['IP']):
+            ip = clean_ip(row['IP'])
+            ip_map[ip] = asset_name
+            
+    # 3. 'hidden PLC'의 특수 IP 처리
+    hidden_plc_ip = clean_ip(df_ip.iloc[10, 6]) # G11 (0-based 10, 6)
+    if hidden_plc_ip:
+         ip_map[hidden_plc_ip] = 'hidden PLC'
+         
+    logging.info(f"자산 IP 맵 생성 완료: {len(ip_map)}개 항목")
+    return ip_map
+
+def load_register_maps(excel_file: str) -> Dict[str, Dict[str, str]]:
     """
-    "192,168.10.25", "modbus: 192.168.1.22/502", "192.1681.12" 같은
-    다양한 IP 문자열을 정리합니다.
+    (수정) '유선_Input', '유선_Output', '무선' 시트를 모두 읽어
+    { 자산명 -> {레지스터 주소 -> 설명} } 맵을 생성
     """
-    if not isinstance(ip_str, str):
+    all_maps: Dict[str, Dict[str, str]] = {}
+    sheet_names = ['유선_Input', '유선_Output', '무선']
+    
+    for sheet in sheet_names:
+        try:
+            df = pd.read_excel(excel_file, sheet_name=sheet, dtype=str)
+            
+            if '내용' not in df.columns:
+                logging.warning(f"'{sheet}' 시트에 '내용' 컬럼이 없어 건너뜁니다.")
+                continue
+            
+            df.dropna(subset=['내용'], inplace=True)
+            
+            asset_columns = [col for col in df.columns if col in DEVICE_NAME_MAP]
+            
+            for asset_col_name in asset_columns:
+                asset_name = DEVICE_NAME_MAP[asset_col_name]
+                
+                if asset_name not in all_maps:
+                    all_maps[asset_name] = {}
+                    
+                # '내용'과 '레지스터 주소' 컬럼만 추출
+                register_map_df = df.dropna(subset=[asset_col_name])[['내용', asset_col_name]]
+                
+                for _, row in register_map_df.iterrows():
+                    desc = row['내용'].strip()
+                    # (수정) 레지스터 주소 자체를 키로 사용
+                    addr_str = str(row[asset_col_name]).strip() 
+                    
+                    if addr_str and desc:
+                        # (수정) Modbus 주소가 '400001.0'처럼 읽히는 것을 방지
+                        if re.match(r'^\d+(\.0)?$', addr_str): # '400001' 또는 '400001.0'
+                            addr_str = addr_str.split('.')[0]
+
+                        # (수정) S7/XGT 주소 정리
+                        addr_str = addr_str.replace('"', '')
+                        # (수정) XGT 주소 '[PLC2]%...' -> '%...'
+                        if addr_str.startswith('['):
+                             addr_str = addr_str.split(']')[-1]
+                        # (수정) XGT 주소 '%MW401 (D500-히든)' -> '%MW401'
+                        addr_str = addr_str.split(' ')[0] 
+                        
+                        if addr_str in all_maps[asset_name]:
+                             logging.warning(f"중복된 레지스터 맵 키: ({asset_name}, {addr_str}). (시트: {sheet})")
+                        all_maps[asset_name][addr_str] = desc
+                         
+            logging.info(f"'{sheet}' 시트 로드 완료. (키: 레지스터 주소)")
+            
+        except Exception as e:
+            logging.error(f"'{sheet}' 시트 로드 중 오류: {e}")
+            
+    total_mappings = sum(len(v) for v in all_maps.values())
+    logging.info(f"전체 레지스터 맵 생성 완료: {len(all_maps)}개 자산, {total_mappings}개 매핑")
+    return all_maps
+
+def translate_xgt_byte_addr(byte_addr: str) -> Optional[str]:
+    """
+    (신규) LS XGT FEnet 바이트 주소 (예: %DB001000)를 워드 주소 (예: D500)로 변환
+    규칙 1: %DB -> D, %MB -> M, %PB -> P
+    규칙 2: 숫자 // 2
+    """
+    if not isinstance(byte_addr, str) or not byte_addr.startswith('%') or len(byte_addr) < 4:
         return None
     
-    # "192,168.10.25" -> 192.168.10.25
-    ip_str = ip_str.replace('"', '').replace(',', '.')
+    mem_type = byte_addr[1:3] # 'DB', 'MB', 'PB'
+    num_str = byte_addr[3:]
     
-    # "modbus: 192.168.1.22/502" -> 192.168.1.22
-    match = re.search(r'(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})', ip_str)
-    if match:
-        ip_str = match.group(1)
-    
-    # "192.1681.12" (오타 수정)
-    if ip_str == '192.1681.12':
-        return '192.168.1.12'
-        
-    # 유효한 IP 형식인지 간단히 확인
-    if re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$', ip_str):
-        return ip_str
-        
-    return None
+    word_type = None
+    if mem_type == 'DB':
+        word_type = 'D'
+    elif mem_type == 'MB':
+        word_type = 'M'
+    elif mem_type == 'PB':
+        word_type = 'P'
+    else:
+        return None # 모르는 바이트 타입 (예: %MW, %IX)
 
-def parse_asset_ip_sheet(excel_file_path: str, sheet_name: str = '자산IP') -> Dict[str, str]:
+    try:
+        byte_num = int(num_str)
+        word_num = byte_num // 2
+        return f"{word_type}{word_num}"
+    except ValueError:
+        return None
+
+def find_asset_description(row: pd.Series) -> str:
     """
-    '자산IP' 시트(Excel)를 읽어 {IP: 자산명} 딕셔너리를 반환합니다.
-    (키: IP, 값: 자산명으로 변경 - IP로 장치명을 찾아야 하므로)
+    (수정) co.py의 변환 규칙 (S7, Modbus, XGT)을 적용하여 레지스터 설명을 찾는 함수
     """
     try:
-        df = pd.read_excel(excel_file_path, sheet_name=sheet_name, header=2) # 3번째 줄을 헤더로 사용
-    except Exception as e:
-        logging.error(f"Error reading {excel_file_path} (Sheet: {sheet_name}): {e}", exc_info=True)
-        return {}
-
-    asset_ip_map: Dict[str, str] = {}
-    
-    # 1. 무선 자산 파트 (B, C 컬럼)
-    wireless_assets = df[['구분', 'IP 정보']].copy()
-    wireless_assets.columns = ['Asset_Name', 'IP_Address']
-    
-    # 2. 유선 자산 파트 (F, G 컬럼)
-    wired_assets = df[['Device Name', 'IP']].copy()
-    wired_assets.columns = ['Asset_Name', 'IP_Address']
-    
-    # 3. 데이터 합치기 및 정리
-    all_assets = pd.concat([wireless_assets, wired_assets], ignore_index=True)
-    all_assets.dropna(subset=['Asset_Name', 'IP_Address'], how='any', inplace=True)
-    
-    # 헤더 이름이 데이터로 포함된 경우 제거
-    all_assets = all_assets[~all_assets['Asset_Name'].isin(['구분', 'Device Name'])]
-    
-    for _, row in all_assets.iterrows():
-        asset_name = str(row['Asset_Name']).replace('\n', ' ').strip()
-        ip_address = clean_ip(row['IP_Address'])
+        direction = row.get('dir')
+        asset_name = 'Unknown'
         
-        if asset_name and ip_address:
-            # 키: IP 주소, 값: 자산 이름
-            asset_ip_map[ip_address] = asset_name
-            
-    return asset_ip_map
-
-def load_wired_register_maps(excel_file_path: str) -> Dict[Tuple[str, str], str]:
-    """
-    '유선_Input/Output' 시트를 읽어 레지스터 맵을 생성합니다.
-    (수정) Map Key: (Asset_Name, 번호_str)
-    Map Value: Description
-    """
-    register_map: Dict[Tuple[str, str], str] = {}
-    sheets_to_process = {
-        '유선_Input': 'Input',
-        '유선_Output': 'Output',
-    }
-
-    # --- 1. 유선 시트 처리 ---
-    for sheet_name, direction in sheets_to_process.items():
-        try:
-            df = pd.read_excel(excel_file_path, sheet_name=sheet_name)
-            
-            # '번호', '내용'을 제외한 컬럼을 장치 컬럼으로 간주
-            device_cols = [col for col in df.columns if col not in ['번호', '내용']]
-            
-            for _, row in df.iterrows():
-                description = row['내용']
-                # (수정) '번호'를 정수형으로 읽고 문자열로 변환 (엑셀 형식 일관성)
-                beonho_str = str(int(row['번호'])) 
-                
-                if pd.isna(description) or pd.isna(beonho_str):
-                    continue
-                
-                for device_col_name in device_cols:
-                    # 'LS 산전 주소' -> 'LS Electric PLC'
-                    asset_name = DEVICE_NAME_MAP.get(device_col_name)
-                    if not asset_name:
-                        continue # 매핑 대상이 아닌 컬럼 (예: '탈부착...')
-                    
-                    # (수정) 이 컬럼에 값이 있는지(NA) 여부만 확인
-                    if pd.isna(row[device_col_name]):
-                        continue
-                    
-                    # (키): (자산명, 번호_문자열)
-                    # (값): 설명
-                    # 예: ('Mitsubishi PLC', '95') -> '스칼라 배출 카운터'
-                    register_key = (asset_name, beonho_str)
-                    register_map[register_key] = str(description)
-
-        except Exception as e:
-            logging.warning(f"Warning: Could not process sheet '{sheet_name}' in {excel_file_path}. {e}")
-
-    # (수정) '무선' 시트 처리 로직 제거
-    
-    return register_map
-
-# ====================================================================
-# 병렬 작업자 초기화 함수
-# ====================================================================
-
-def init_worker(ip_map: Dict[str, str], wired_reg_map: Dict[Tuple[str, str], str]):
-    """
-    ProcessPoolExecutor의 각 작업자(worker)를 초기화합니다.
-    """
-    global global_asset_ip_map, global_wired_register_map
-    global_asset_ip_map = ip_map
-    global_wired_register_map = wired_reg_map # (수정)
-    logging.info(f"Worker (PID: {os.getpid()}) initialized with {len(ip_map)} IP mappings and {len(wired_reg_map)} register mappings.")
-
-# ====================================================================
-# 핵심 파싱 로직 (단일 파일 처리)
-# ====================================================================
-
-def find_wired_description(row: pd.Series) -> str:
-    """
-    (수정) pdu.addr (요청) 또는 'pdu.regs.*' (응답)을 기반으로
-    global_wired_register_map에서 레지스터 설명을 찾습니다.
-    (신규 규칙) pdu.addr은 0-based offset, 엑셀 '번호'는 1-based.
-               '번호' = pdu.addr + 1
-    """
-    
-    # 1. Request 패킷 확인 (pdu.addr이 숫자일 경우)
-    addr = row.get('pdu.addr')
-    if pd.notna(addr):
-        try:
-            # Request는 PLC로 보낸 것 (dst_device가 PLC)
+        # 1. 자산명 결정
+        if direction == 'request':
             asset_name = row.get('dst_device', 'Unknown')
-            
-            # (수정) '번호' = pdu.addr + 1
-            beonho_str = str(int(addr) - 1) 
-            
-            key = (asset_name, beonho_str)
-            desc = global_wired_register_map.get(key)
-            if desc:
-                # 예: pdu.addr: 2 -> 번호: 3 ('송신DATA교반기 인버터 RST')
-                return desc 
-        except Exception:
-            pass # addr이 숫자가 아닐 경우 무시
+        elif direction == 'response':
+            asset_name = row.get('src_device', 'Unknown')
+        else:
+            return 'N/A' # dir 정보가 없으면 매핑 불가
 
-    # 2. Response 패킷 확인 (dir == 'response' 이고 'pdu.regs.' 컬럼 확인)
-    if row.get('dir') == 'response':
-        # Response는 PLC가 보낸 것 (src_device가 PLC)
-        asset_name = row.get('src_device', 'Unknown')
-        descriptions = []
+        if asset_name == 'Unknown' or asset_name not in global_all_register_maps:
+            return 'N/A' # 매핑 대상 자산이 아니거나 맵이 없음
+
+        register_map = global_all_register_maps[asset_name]
         
-        # row.index (컬럼 이름들)을 순회
-        for col_name in row.index:
-            # 'pdu.regs.2', 'pdu.regs.95' 같은 컬럼을 찾음
-            if col_name.startswith('pdu.regs.'):
-                value = row[col_name]
-                if pd.isna(value): # 값이 NaN이면 스킵
-                    continue
-                    
-                # 'pdu.regs.2' -> '2'
-                beonho_from_key_str = col_name.replace('pdu.regs.', '')
-                
+        # --- 프로토콜별 주소 '번역' ---
+        
+        lookup_addr_list: List[Tuple[str, Any]] = [] # (번역된 주소, 값)
+        
+        # 2. Function Code 추출 (Modbus/S7 확인용)
+        fc = row.get('pdu.fc')
+        fc_int = None
+        if pd.notna(fc):
+            try: 
+                fc_int = int(fc)
+            except ValueError: 
+                pass # fc가 숫자가 아님
+
+        # 3. SIEMENS S7 규칙 (Simens PLC)
+        if asset_name == 'Simens PLC':
+            db_num = row.get('pdu.prm.itms.db') # 단일 항목
+            addr = row.get('pdu.prm.itms.addr')
+            
+            if pd.isna(db_num):
+                db_num = row.get('pdu.prm.itms.0.db') # 리스트의 0번째 항목
+                addr = row.get('pdu.prm.itms.0.addr')
+
+            if pd.notna(db_num) and pd.notna(addr):
                 try:
-                    beonho_str = str(int(beonho_from_key_str) - 1) 
-                except ValueError:
-                    continue # 키가 숫자가 아니면 스킵
+                    # (규칙) "DB{db},{addr}"
+                    lookup_addr = f"DB{int(db_num)},{int(addr)}"
+                    lookup_addr_list.append((lookup_addr, None)) # S7 Request는 값 모름
+                except Exception:
+                    pass
+            # S7 Response (규칙 불명확)
+            # elif direction == 'response':
+            #    return 'N/A (S7 Response)'
 
-                key = (asset_name, beonho_str)
-                desc = global_wired_register_map.get(key)
-                
-                if desc:
+        # 4. Modbus 규칙 (Mitsubishi, LS, hidden)
+        offset_key = (asset_name, fc_int)
+        if offset_key in MODBUS_OFFSET_MAP:
+            offset, addr_type = MODBUS_OFFSET_MAP[offset_key]
+            
+            if addr_type == 'modbus':
+                # 4a. Modbus Request (pdu.addr)
+                addr = row.get('pdu.addr')
+                if pd.notna(addr):
+                    try:
+                        # (규칙) offset + pdu.addr + 1
+                        lookup_addr = str(int(offset + addr + 1))
+                        lookup_addr_list.append((lookup_addr, None)) # Request는 값 모름
+                    except Exception:
+                        pass
+
+                # 4b. Modbus Response (pdu.regs.*)
+                elif direction == 'response':
+                    for col_name in row.index:
+                        if col_name.startswith('pdu.regs.'):
+                            value = row[col_name]
+                            if pd.isna(value): continue
+                            try:
+                                reg_key_int = int(col_name.replace('pdu.regs.', ''))
+                                # (규칙) offset + reg_key + 1
+                                lookup_addr = str(int(offset + reg_key_int + 1))
+                                lookup_addr_list.append((lookup_addr, value))
+                            except Exception:
+                                continue
+
+        # 5. LS XGT FEnet 규칙 (LS Electric PLC, XGI)
+        elif 'LS' in asset_name or 'XGI' in asset_name:
+            xgt_addr_str = None
+            xgt_val = None
+            
+            # 1순위: pdu.var.nm (바이트 주소 문자열 -> 번역 필요)
+            addr_nm = row.get('pdu.var.nm')
+            if pd.notna(addr_nm):
+                xgt_addr_str = translate_xgt_byte_addr(str(addr_nm))
+                if direction == 'response' and pd.notna(row.get('pdu.dat.val')):
+                     xgt_val = row.get('pdu.dat.val') # (가정)
+            
+            # 2순위: pdu.var (이미 워드 주소 문자열)
+            if not xgt_addr_str and pd.notna(row.get('pdu.var')):
+                xgt_addr_str = str(row.get('pdu.var'))
+                if direction == 'response' and pd.notna(row.get('pdu.dat.itms.data')):
+                     xgt_val = row.get('pdu.dat.itms.data') # (기존 가정)
+            
+            # 3순위: pdu.prm.itms.var (블록)
+            if not xgt_addr_str and pd.notna(row.get('pdu.prm.itms.var')):
+                 xgt_addr_str = str(row.get('pdu.prm.itms.var'))
+                 if direction == 'response' and pd.notna(row.get('pdu.dat.itms.0.data')):
+                     xgt_val = row.get('pdu.dat.itms.0.data') # (기존 가정)
+
+            # 4순위: pdu.prm.itms.0.var (리스트의 첫 변수)
+            if not xgt_addr_str and pd.notna(row.get('pdu.prm.itms.0.var')):
+                 xgt_addr_str = str(row.get('pdu.prm.itms.0.var'))
+                 if direction == 'response' and pd.notna(row.get('pdu.dat.itms.0.data')):
+                     xgt_val = row.get('pdu.dat.itms.0.data') # (기존 가정)
+
+            if xgt_addr_str:
+                lookup_addr = xgt_addr_str.split(' ')[0] # '%MW401 (D500..)' 정리
+                lookup_addr_list.append((lookup_addr, xgt_val))
+
+        # --- 매핑 수행 ---
+        if not lookup_addr_list:
+            return 'N/A'
+
+        descriptions = []
+        for lookup_addr, value in lookup_addr_list:
+            desc = register_map.get(lookup_addr)
+            if desc:
+                if value is not None and pd.notna(value):
                     descriptions.append(f"{desc} (val: {value})")
+                else:
+                    descriptions.append(desc) # Request
+            else:
+                descriptions.append(f"N/A (Addr: {lookup_addr})")
         
-        if descriptions:
-            return "; ".join(descriptions)
+        return "; ".join(descriptions)
 
-    # 3. 매핑되는 것이 없을 경우
-    return 'N/A'
+    except Exception as e:
+        # logging.warning(f"find_asset_description 오류: {e} - 행: {row.get('tid', 'N/A')}")
+        return f'N/A (Error)'
 
 
+# --- 병렬 처리 작업자 ---
+
+def init_worker(ip_map: Dict[str, str], reg_maps: Dict[str, Dict[str, str]]):
+    """ 병렬 작업자 프로세스 초기화 """
+    global global_asset_ip_map
+    global global_all_register_maps
+    global_asset_ip_map = ip_map
+    global_all_register_maps = reg_maps
+    # logging.info(f"Worker (PID: {os.getpid()}) initialized with {len(ip_map)} IP mappings and {len(reg_maps)} register map keys.")
 
 def process_file(input_filename: str, output_dir: str) -> Optional[str]:
     """
     CSV 파일 하나를 읽고, 'd' 컬럼의 JSON을 파싱하여 펼친 후,
-    IP와 레지스터를 매핑하여 저장합니다.
+    IP 매핑 및 레지스터 매핑을 수행하고 저장합니다.
     """
     try:
         base_filename = os.path.basename(input_filename)
@@ -252,227 +351,174 @@ def process_file(input_filename: str, output_dir: str) -> Optional[str]:
         # 1. CSV 파일 읽기
         df = pd.read_csv(input_filename)
 
-        # 2. 'd' 컬럼이 비어있거나 유효한 JSON이 아닌 행 제거
+        # 2. 'd' 컬럼 비우기
         df.dropna(subset=['d'], inplace=True)
         if df.empty:
             logging.warning(f"'{base_filename}' has no data to process after dropping NaNs.")
             return None
 
         # 3. orjson으로 JSON 로드
-        def safe_json_load(x):
+        def safe_json_load(x: Any) -> Optional[Dict]:
             if not isinstance(x, str):
                 return None
             try:
-                # pandas가 CSV를 읽을 때 "..." -> {...} 로 올바르게 파싱한 경우
                 return json.loads(x)
             except json.JSONDecodeError:
                 try:
-                    # pandas가 CSV를 잘못 읽어 '"{""prid...""}"' 처럼 문자열이 된 경우
                     return json.loads(x.strip('"').replace('""', '"'))
                 except Exception:
                     # logging.warning(f"Failed to parse JSON string in {base_filename}: {x[:50]}...")
-                    return None # 여전히 실패하면 None 반환
+                    return None
 
         json_series = df['d'].apply(safe_json_load)
         
-        # 파싱에 실패한 행(None) 제거
         valid_json_indices = json_series.dropna().index
         if len(valid_json_indices) == 0:
             logging.warning(f"'{base_filename}' contains no valid JSON in 'd' column after parsing attempts.")
             return None
         
-        # 파싱에 성공한 데이터만 유지 (SettingWithCopyWarning 방지)
         df = df.loc[valid_json_indices].copy()
         json_series = json_series.loc[valid_json_indices]
 
         # 4. pd.json_normalize로 1차 펼치기
-        # (pdu.regs가 dict라면 { '2': 0, '3': 0 } -> 'pdu.regs.2': 0, 'pdu.regs.3': 0 으로 펼쳐짐)
-        flattened_json_df = pd.json_normalize(json_series)
-        flattened_json_df.index = df.index # 원본 인덱스 유지
+        # max_level=None 유지 (S7, XGT의 중첩 구조를 펼쳐야 함)
+        flattened_json_df = pd.json_normalize(json_series, max_level=None)
+        flattened_json_df.index = df.index
 
-        # 5. (신규) 중복 컬럼 제거 (JSON 내부의 'sip' 등이 원본 'sip'와 충돌하는 것 방지)
+        # 5. 중복 컬럼 제거
         original_cols = set(df.columns)
-        json_cols = set(flattened_json_df.columns)
-        duplicate_cols = original_cols.intersection(json_cols)
-        
-        if duplicate_cols:
-            # 'd' 컬럼은 어차피 df에서 삭제될 것이므로 중복 목록에서 제외
-            duplicate_cols.discard('d')
-            if duplicate_cols:
-                logging.info(f"Dropping duplicate columns from normalized JSON in '{base_filename}': {duplicate_cols}")
-                flattened_json_df.drop(columns=list(duplicate_cols), inplace=True)
+        json_cols_to_drop = [col for col in flattened_json_df.columns if col in original_cols]
+        if json_cols_to_drop:
+            flattened_json_df.drop(columns=json_cols_to_drop, inplace=True)
 
-        # 6. 원본 데이터프레임과 결합 후, 불필요한 'd' 컬럼 제거
+        # 6. 원본과 결합
         df_expanded = pd.concat([df.drop(columns=['d']), flattened_json_df], axis=1)
 
-        # 7. 중첩된 list 컬럼(itms)을 추가로 펼치는 로직
-        # (수정) pdu.regs는 펼치지 않음 (딕셔너리 자체로 사용)
-        list_columns_to_expand = ['pdu.prm.itms', 'pdu.dat.itms']
-        
-        for col_name in list_columns_to_expand:
-            if col_name in df_expanded.columns:
-                # logging.info(f"Expanding nested list/dict in '{col_name}' for {base_filename}...")
-                
-                def clean_list(x):
-                    # pdu.regs는 dict, pdu.prm.itms는 list
-                    if (isinstance(x, list) and len(x) > 0) or isinstance(x, dict):
-                        return x
-                    return pd.NA
-                    
-                df_expanded[col_name] = df_expanded[col_name].apply(clean_list)
-                
-                if df_expanded[col_name].isna().all():
-                    # logging.info(f"Skipping empty list column '{col_name}'.")
-                    continue
-
-                # 'pdu.regs'는 dict이므로 explode하면 에러 발생.
-                # list인 경우에만 explode 수행
-                if isinstance(df_expanded[col_name].dropna().iloc[0], list):
-                    df_expanded = df_expanded.explode(col_name)
-                
-                # dict 또는 list 안의 dict를 normalize
-                try:
-                    normalized_col = pd.json_normalize(df_expanded[col_name])
-                    
-                    # pdu.regs의 경우 컬럼 이름이 '2', '3', '4'...
-                    # pdu.dat.itms의 경우 'rc', 'syn'...
-                    # add_prefix가 유용함.
-                    normalized_col = normalized_col.add_prefix(f"{col_name}.")
-                    
-                    df_expanded = df_expanded.drop(columns=[col_name]).join(normalized_col)
-                except Exception as e:
-                    logging.warning(f"Could not normalize column '{col_name}': {e}")
-
-
-        # ====================================================================
-        # 8. (신규) 자산 IP 매핑
-        # ====================================================================
-        # (IP 매핑을 레지스터 매핑보다 먼저 수행해야 src/dst_device를 사용 가능)
+        # 7. IP 주소를 자산명으로 매핑
         if 'sip' in df_expanded.columns:
             df_expanded['src_device'] = df_expanded['sip'].map(global_asset_ip_map).fillna('Unknown')
         else:
-            df_expanded['src_device'] = 'Unknown' # 컬럼이 없는 경우
+            df_expanded['src_device'] = 'Unknown'
             
         if 'dip' in df_expanded.columns:
             df_expanded['dst_device'] = df_expanded['dip'].map(global_asset_ip_map).fillna('Unknown')
         else:
-            df_expanded['dst_device'] = 'Unknown' # 컬럼이 없는 경우
+            df_expanded['dst_device'] = 'Unknown'
 
-        # ====================================================================
-        # 9. (수정) 레지스터 설명 매핑
-        # ====================================================================
-        # (pdu.regs는 펼쳐져서 'pdu.regs.2' 등으로 존재)
-        df_expanded['asset_description'] = df_expanded.apply(find_wired_description, axis=1)
-
+        # 8. (수정) 레지스터 주소/번호를 자산 설명으로 매핑
+        if not global_all_register_maps:
+            df_expanded['asset_description'] = 'N/A (Map Not Loaded)'
+        else:
+            # .apply()가 행(Series)을 함수로 전달
+            df_expanded['asset_description'] = df_expanded.apply(find_asset_description, axis=1)
+        
+        # 9. (주석 처리) 중첩 리스트 펼치기 (pdu.prm.itms)
+        # S7/XGT 매핑을 위해 pdu.prm.itms가 펼쳐져야 함 (json_normalize가 처리)
+        # 만약 S7/XGT pdu.prm.itms가 리스트이고 모든 항목을 봐야 한다면,
+        # find_asset_description 전에 explode 로직이 필요함.
+        # list_columns_to_expand = ['pdu.prm.itms'] 
+        
         # 10. 결과 파일 저장
         output_filename = os.path.join(output_dir, f"{os.path.splitext(base_filename)[0]}_parsed.csv")
-        # NaN 값을 빈 문자열('')로 저장
         df_expanded.to_csv(output_filename, index=False, na_rep='')
         
         return f"Successfully processed '{base_filename}' -> '{os.path.basename(output_filename)}'"
 
     except Exception as e:
-        # traceback을 포함하여 더 자세한 에러 로깅
         logging.error(f"Critical error processing '{os.path.basename(input_filename)}': {e}", exc_info=True)
         return f"Error processing '{os.path.basename(input_filename)}': {e}"
 
-# ====================================================================
-# 메인 실행 함수
-# ====================================================================
+# --- 메인 실행 로직 ---
 
 def main():
-    # ====================================================================
-    # argparse를 사용하여 커맨드라인에서 경로를 입력받습니다.
-    # ====================================================================
-    parser = argparse.ArgumentParser(description="Parse JSON data within CSV files, map Asset IPs, and map Registers.")
+    parser = argparse.ArgumentParser(description="Parse JSON data within CSV files and map asset/register info.")
     
-    parser.add_argument('--input-dir', type=str, default='../../TCP_Datagram_parser/output', 
+    parser.add_argument('--input-dir', type=str, default='../../TCP_Datagram_parser/output',
                         help='Directory containing input CSV files.')
+    
+    parser.add_argument('--mapping-file', type=str, default='2. 자산 목록 및 레지스터 매핑표.xlsx', 
+                        help="Path to the Excel file containing '자산IP', '유선_Input', '유선_Output', '무선' sheets.")
                         
     parser.add_argument('--output-dir', type=str, default='./pcap/output', 
-                        help='Directory to save processed CSV files.')
-                        
-    parser.add_argument('--mapping-file', type=str, 
-                        default='./2. 자산 목록 및 레지스터 매핑표.xlsx', 
-                        help="Path to the Excel file containing '자산IP', '유선_Input/Output', '무선' sheets.")
+                        help="Directory to save processed CSV files.")
+    
     args = parser.parse_args()
 
-    # --- 1. 필수 파일 확인 ---
+    # --- 0. 필수 파일 확인 ---
     if not os.path.exists(args.mapping_file):
-        logging.error(f"[오류] 필수 매핑 파일 '{args.mapping_file}'을(를) 찾을 수 없습니다.")
-        logging.error("스크립트를 종료합니다.")
+        logging.error(f"[오류] 매핑 파일(Excel)을 찾을 수 없습니다: {args.mapping_file}")
+        return
+    if not os.path.isdir(args.input_dir):
+        logging.error(f"[오류] 입력 디렉터리(CSV)를 찾을 수 없습니다: {args.input_dir}")
         return
 
-    # --- 2. 매핑 정보 로드 (메인 프로세스에서 한 번만) ---
-    logging.info(f"Loading IP mappings from '{args.mapping_file}' (자산IP 시트)...")
-    # {IP: AssetName}
-    asset_ip_map = parse_asset_ip_sheet(args.mapping_file)
-    if not asset_ip_map:
-        logging.error("자산 IP 정보를 로드하는 데 실패했습니다. 스크립트를 종료합니다.")
-        return
-    logging.info(f"-> {len(asset_ip_map)}개의 IP-자산 매핑을 로드했습니다.")
-
-    logging.info(f"Loading Wired Register mappings from '{args.mapping_file}' (유선 시트)...")
-    # (수정)
-    # {(AssetName, 번호_Str): Description}
-    wired_register_map = load_wired_register_maps(args.mapping_file)
-    if not wired_register_map:
-        logging.warning("유선 레지스터 매핑 정보를 로드하지 못했거나, 매핑이 비어있습니다.")
-    logging.info(f"-> {len(wired_register_map)}개의 유선 레지스터-설명 매핑을 로드했습니다.")
-
-
-    # --- 3. 처리할 파일 목록 가져오기 ---
     os.makedirs(args.output_dir, exist_ok=True)
     
+    # --- 1. (메인 프로세스) Excel 매핑 파일 미리 로드 ---
+    logging.info(f"Loading IP mappings from '{args.mapping_file}' (자산IP 시트)...")
     try:
-        files_to_process = [
-            os.path.join(args.input_dir, f) for f in os.listdir(args.input_dir)
-            if f.endswith('.csv') and '_parsed' not in f
-        ]
-    except FileNotFoundError:
-        logging.error(f"[오류] 입력 디렉터리 '{args.input_dir}'을(를) 찾을 수 없습니다.")
-        logging.error("스크립트를 종료합니다.")
+        df_ip = pd.read_excel(args.mapping_file, sheet_name='자산IP', header=None)
+        asset_ip_map = parse_asset_ip_sheet(df_ip)
+    except Exception as e:
+        if 'openpyxl' in str(e):
+            logging.error("="*50)
+            logging.error(" [오류] 'openpyxl' 라이브러리가 필요합니다. ")
+            logging.error(" 터미널에서 'pip install openpyxl'을 실행해주세요. ")
+            logging.error("="*50)
+        else:
+            logging.error(f"'자산IP' 시트 로드 실패: {e}", exc_info=True)
         return
 
+    logging.info(f"Loading register mappings from '{args.mapping_file}' (유선/무선 시트)...")
+    # (수정) '레지스터 주소'를 키로 사용하는 새 함수 호출
+    all_register_maps = load_register_maps(args.mapping_file)
+
+    if not asset_ip_map or not all_register_maps:
+        logging.error("매핑 정보(IP 또는 레지스터)를 로드하지 못했습니다. 스크립트를 종료합니다.")
+        return
+
+    # --- 2. 처리할 CSV 파일 목록 가져오기 ---
+    files_to_process = [
+        os.path.join(args.input_dir, f) for f in os.listdir(args.input_dir)
+        if f.endswith('.csv') and '_parsed' not in f
+    ]
+
     if not files_to_process:
-        # (수정) 오타 수정
         logging.warning(f"No .csv files to process in '{args.input_dir}'.")
         return
 
-    # --- 4. 병렬 처리 실행 ---
+    # --- 3. 병렬 처리 실행 ---
     num_workers = multiprocessing.cpu_count()
     logging.info(f"Starting ProcessPoolExecutor with {num_workers} workers for {len(files_to_process)} files.")
     
     with ProcessPoolExecutor(
         max_workers=num_workers,
-        # init_worker 함수를 호출하여 각 작업자에 맵 전달
         initializer=init_worker,
-        initargs=(asset_ip_map, wired_register_map) # (수정)
+        initargs=(asset_ip_map, all_register_maps) # 수정된 맵 전달
     ) as executor:
         
         futures = [executor.submit(process_file, filename, args.output_dir) for filename in files_to_process]
         
-        for future in futures: 
-            result = future.result()
-            if result:
-                logging.info(result)
+        for future in futures:
+            try:
+                result = future.result()
+                if result:
+                    logging.info(result)
+            except Exception as e:
+                logging.error(f"A worker process failed: {e}", exc_info=True)
     
-    logging.info("All processing finished.")
+    logging.info(f"All processing finished.")
 
 if __name__ == "__main__":
-    # Windows에서 ProcessPoolExecutor를 사용할 경우 필요
-    multiprocessing.freeze_support() 
-    
-    # openpyxl 라이브러리 확인
     try:
         import openpyxl
     except ImportError:
-        logging.error("="*60)
-        logging.error(" [오류] 'openpyxl' 라이브러리가 설치되지 않았습니다.")
-        logging.error(" Excel 파일을 읽으려면 이 라이브러리가 필요합니다.")
-        logging.error(" 터미널에서 `pip install openpyxl` 명령어를 실행해주세요.")
-        logging.error("="*60)
-        exit(1)
+        logging.warning("="*50)
+        logging.warning(" [경고] 'openpyxl' 라이브러리가 없습니다. ")
+        logging.warning(" Excel 매핑 파일을 읽기 위해 설치가 필요합니다. ")
+        logging.warning(" > pip install openpyxl ")
+        logging.warning("="*50)
         
     main()
+
 
